@@ -2,8 +2,9 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-static char *ngx_http_demo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf); 
-static ngx_int_t ngx_http_demo_handler(ngx_http_request_t *r); 
+static char *ngx_http_demo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_demo_handler(ngx_http_request_t *r);
+static char* ngx_http_demo_arg_strscript(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static void* ngx_http_demo_create_loc_conf(ngx_conf_t *cf);
 
@@ -39,6 +40,10 @@ typedef struct {
     ngx_bufs_t arg_bufs;
     ngx_uint_t arg_enum;
     ngx_uint_t arg_bitmask;
+
+    ngx_array_t *arg_strscript_lengths;
+    ngx_array_t *arg_strscript_values;
+	ngx_str_t arg_strscript;
 
 } ngx_http_demo_loc_conf_t;
 
@@ -134,6 +139,13 @@ static ngx_command_t ngx_http_demo_commands[] = {
     offsetof(ngx_http_demo_loc_conf_t, arg_bitmask),
     &ngx_http_demo_bitmask},
 
+    { ngx_string("demo_arg_strscript"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_http_demo_arg_strscript,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    0,
+    NULL },
+
     ngx_null_command
 };
 
@@ -162,6 +174,8 @@ ngx_module_t ngx_http_demo_module = {
     NULL,
     NGX_MODULE_V1_PADDING
 };
+
+static ngx_int_t ngx_http_demo_arg_strscript_eval(ngx_http_request_t *r, ngx_http_demo_loc_conf_t *dlcf);
 
 static char *ngx_http_demo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     ngx_http_core_loc_conf_t *clcf;
@@ -201,15 +215,32 @@ static ngx_int_t ngx_http_demo_handler(ngx_http_request_t *r) {
         ngx_sprintf(buffer_keyval, "%s\n\tkey:%s, val:%s", buffer_keyval, (char*)tmpkv[i].key.data, (char*)tmpkv[i].value.data);
     }
 
+	if (ngx_http_demo_arg_strscript_eval(r, democf) != NGX_OK) {
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	}
+
     u_char buffer[1000];
     ngx_memset(buffer, 0, sizeof(buffer));
     ngx_sprintf(buffer, 
-            "arg_flag: %d\narg_str: %V\narg_num: %d\narg_str_array: %s\narg_keyval: %s\narg_size: %d\narg_off: %L\narg_msec: %d\narg_sec: %d\narg_bufs:\n\tnum: %d\n\tsize: %d\narg_enum: %d\narg_bitmask: %d",
+            "arg_flag: %d\n"
+			"arg_str: %V\n"
+            "arg_num: %d\n"
+            "arg_str_array: %s\n"
+            "arg_keyval: %s\n"
+            "arg_size: %d\n"
+            "arg_off: %L\n"
+            "arg_msec: %d\n"
+            "arg_sec: %d\n"
+            "arg_bufs:\n\tnum: %d\n\tsize: %d\n"
+            "arg_enum: %d\n"
+            "arg_bitmask: %d\n"
+            "arg_strscript: %V\n",
             democf->arg_flag, &democf->arg_str, democf->arg_num, 
             (char*)buffer_strarray, (char*)buffer_keyval, democf->arg_size,
             democf->arg_off, democf->arg_msec, democf->arg_sec,
             democf->arg_bufs.num, democf->arg_bufs.size, democf->arg_enum,
-			democf->arg_bitmask);
+			democf->arg_bitmask,
+            &democf->arg_strscript);
     ngx_str_t response = ngx_string(buffer);
 
     r->headers_out.status = NGX_HTTP_OK;
@@ -278,7 +309,54 @@ static char* ngx_http_demo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *ch
     ngx_conf_merge_uint_value(conf->arg_enum, prev->arg_enum, 0);
     ngx_conf_merge_bitmask_value(conf->arg_bitmask, prev->arg_bitmask,
                               (NGX_CONF_BITMASK_SET | NGX_http_demo_BIT1));
+    ngx_conf_merge_str_value(conf->arg_str, prev->arg_str, "default");
 
     return NGX_CONF_OK;
+}
+
+static char* ngx_http_demo_arg_strscript(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_http_demo_loc_conf_t *dlcf = conf;
+
+    ngx_str_t *value, *url;
+    ngx_uint_t n;
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_http_script_compile_t sc;
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_demo_handler;
+    value = cf->args->elts;
+
+    url = &value[1];
+    n = ngx_http_script_variables_count(url);
+    if (n) {
+        ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
+
+        sc.cf = cf;
+        sc.source = url;
+        sc.lengths = &dlcf->arg_strscript_lengths;
+        sc.values = &dlcf->arg_strscript_values;
+        sc.variables = n;
+        sc.complete_lengths = 1;
+        sc.complete_values = 1;
+
+        if (ngx_http_script_compile(&sc) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        return NGX_CONF_OK;
+    }
+
+    return NGX_CONF_OK;
+}
+
+static ngx_int_t ngx_http_demo_arg_strscript_eval(ngx_http_request_t *r, ngx_http_demo_loc_conf_t *dlcf) {
+    if (ngx_http_script_run(r, &dlcf->arg_strscript, dlcf->arg_strscript_lengths->elts, 0,
+                            dlcf->arg_strscript_values->elts)
+        == NULL)
+    {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
 }
 
